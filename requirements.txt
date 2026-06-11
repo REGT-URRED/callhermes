@@ -1,0 +1,16 @@
+# === CallHermes - Dependencias ===
+# STT local
+faster-whisper
+# TTS gratuito
+edge-tts
+# HTTP async + WebSocket
+aiohttp
+# Variables de entorno
+python-dotenv
+# Lectura asíncrona de archivos
+aiofiles
+
+# Procesamiento de audio
+numpy
+soundfile
+webrtcvad
