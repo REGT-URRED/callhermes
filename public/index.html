@@ -411,11 +411,11 @@
     const vad = await VAD.createStreamingService({
       onSpeechStart: () => startRecording(),
       onSpeechEnd: () => stopRecording(),
-      positiveSpeechThreshold: 0.6,
-      negativeSpeechThreshold: 0.2,
-      minSpeechFrames: 4,
-      preSpeechPadFrames: 8,
-      redemptionFrames: 40,
+      positiveSpeechThreshold: 0.55,
+      negativeSpeechThreshold: 0.15,
+      minSpeechFrames: 3,
+      preSpeechPadFrames: 10,
+      redemptionFrames: 60,
       frameSamples: 1536,
     });
 
@@ -444,11 +444,11 @@
     vadFailed = true;
     hintText.textContent = 'Usando VAD básico por RMS';
 
-    const VAD_THRESHOLD = 0.03;
-    const VAD_STOP = 0.01;
-    const START_FRAMES = 10;
-    const STOP_FRAMES = 90;
-    const MAX_RECORDING = 30000;
+    const VAD_THRESHOLD = 0.025;
+    const VAD_STOP = 0.008;
+    const START_FRAMES = 12;
+    const STOP_FRAMES = 200;
+    const MAX_RECORDING = 60000;
     let loudFrames = 0, silentFrames = 0;
     const buffer = new Float32Array(analyser.fftSize);
 
