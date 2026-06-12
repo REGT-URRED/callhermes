@@ -8,6 +8,12 @@
 <!-- Silero VAD - UMD bundle via CDN -->
 <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.26/dist/bundle.min.js"></script>
 
+<!-- Porcupine Web (wake word) - carga diferida, fallback si falla -->
+<script src="https://cdn.jsdelivr.net/npm/@picovoice/porcupine-web@3.0.2/dist/web/iife/index.js"
+  onerror="window._porcupineFailed=true"></script>
+<script src="https://cdn.jsdelivr.net/npm/@picovoice/web-voice-processor@3.0.2/dist/iife/index.js"
+  onerror="window._porcupineFailed=true"></script>
+
 <style>
   *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -25,6 +31,8 @@
     --processing-glow: rgba(243, 156, 18, 0.3);
     --speaking: #2ecc71;
     --speaking-glow: rgba(46, 204, 113, 0.3);
+    --sleep: #1a1a2e;
+    --sleep-glow: rgba(30, 30, 60, 0.1);
   }
 
   body {
@@ -58,6 +66,14 @@
 
   .orb svg { position: absolute; width: 40px; height: 40px; fill: var(--text-dim); transition: all 0.4s ease; }
 
+  .orb.sleeping {
+    background: var(--sleep);
+    box-shadow: 0 0 8px var(--sleep-glow);
+    opacity: 0.5;
+  }
+  .orb.sleeping .orb-inner { opacity: 0.05; }
+  .orb.sleeping svg { fill: var(--text-dim); opacity: 0.3; }
+
   .orb.listening { box-shadow: 0 0 20px rgba(108, 92, 231, 0.15); }
   .orb.listening .orb-inner { opacity: 0.15; animation: breathe 3s ease-in-out infinite; }
 
@@ -78,6 +94,7 @@
   @keyframes spin-slow { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
   .status-label { margin-top: 24px; font-size: 15px; font-weight: 500; color: var(--text-dim); letter-spacing: 0.5px; text-transform: uppercase; transition: color 0.3s; }
+  .status-label.sleeping { color: var(--text-dim); opacity: 0.4; }
   .status-label.speaking { color: var(--recording); }
   .status-label.processing { color: var(--processing); }
   .status-label.responding { color: var(--speaking); }
@@ -103,12 +120,19 @@
     border-radius: 8px; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 10; font-weight: 600;
   }
   .bargein-badge.show { opacity: 1; }
+
+  .wake-badge {
+    position: absolute; top: -8px; left: -8px;
+    background: var(--accent); color: #fff; font-size: 9px; padding: 2px 6px;
+    border-radius: 8px; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 10; font-weight: 600;
+  }
+  .wake-badge.show { opacity: 1; }
 </style>
 </head>
 <body>
 
 <div class="orb-container">
-  <div class="orb listening" id="orb">
+  <div class="orb sleeping" id="orb">
     <div class="orb-inner"></div>
     <svg viewBox="0 0 24 24" id="orbIcon">
       <path d="M12 14a4 4 0 0 0 4-4V6a4 4 0 0 0-8 0v4a4 4 0 0 0 4 4z"/>
@@ -116,9 +140,10 @@
     </svg>
   </div>
   <div class="bargein-badge" id="bargeinBadge">✦ BARGE-IN</div>
+  <div class="wake-badge" id="wakeBadge">⚡ WAKE</div>
 </div>
 
-<div class="status-label" id="statusLabel">INICIANDO...</div>
+<div class="status-label sleeping" id="statusLabel">DORMIDO</div>
 
 <div class="wave-bars" id="waveBars">
   <div class="bar"></div><div class="bar"></div><div class="bar"></div>
@@ -134,14 +159,19 @@
 
 <div class="bottom-info">
   <div class="connection-badge" id="connBadge">conectando...</div>
-  <div class="hint" id="hintText">Inicializando Silero VAD...</div>
+  <div class="hint" id="hintText">Inicializando...</div>
 </div>
 
 <script>
 (function() {
   'use strict';
 
-  // ─── DOM refs ───────────────────────────────────────────────────────────────
+  // ═══ CONFIGURACIÓN ═══════════════════════════════════════════════════════
+  // Obtén tu AccessKey gratis en https://console.picovoice.ai/
+  // Sin access key: wake word desactivado (modo siempre-escucha)
+  const PICOVOICE_ACCESS_KEY = ''; // ← PON TU KEY AQUÍ
+
+  // ═══ DOM refs ════════════════════════════════════════════════════════════
   const orb          = document.getElementById('orb');
   const statusLabel  = document.getElementById('statusLabel');
   const waveBars     = document.getElementById('waveBars');
@@ -150,13 +180,20 @@
   const connBadge    = document.getElementById('connBadge');
   const orbIcon      = document.getElementById('orbIcon');
   const bargeinBadge = document.getElementById('bargeinBadge');
+  const wakeBadge    = document.getElementById('wakeBadge');
   const hintText     = document.getElementById('hintText');
 
-  // ─── State machine ──────────────────────────────────────────────────────────
-  const State = { LISTENING: 0, SPEAKING: 1, PROCESSING: 2, RESPONDING: 3 };
-  const stateNames = ['listening', 'speaking', 'processing', 'responding'];
-  const stateLabels = ['ESCUCHANDO...', 'HABLANDO', 'PROCESANDO', 'RESPONDIENDO'];
-  const stateLabelClasses = ['', 'speaking', 'processing', 'responding'];
+  // ═══ State machine ═══════════════════════════════════════════════════════
+  const State = {
+    SLEEPING: 0,
+    LISTENING: 1,
+    SPEAKING: 2,
+    PROCESSING: 3,
+    RESPONDING: 4,
+  };
+  const stateNames = ['sleeping', 'listening', 'speaking', 'processing', 'responding'];
+  const stateLabels = ['DORMIDO', 'ESCUCHANDO...', 'HABLANDO', 'PROCESANDO', 'RESPONDIENDO'];
+  const stateLabelClasses = ['sleeping', '', 'speaking', 'processing', 'responding'];
 
   let state = State.PROCESSING;
   let stream = null;
@@ -170,11 +207,19 @@
   let silenceTimer = null;
   const sessionId = crypto.randomUUID();
 
+  // Wake word state
+  let porcupineEngine = null;
+  let webVoiceProcessor = null;
+  let wakeWordEnabled = false;
+  let wakeWordReady = false;
+  let idleTimer = null;
+  const IDLE_TIMEOUT_MS = 30000;
+
   // Audio context for wave visualization
   let audioCtx = null;
   let analyser = null;
 
-  // ─── Set visual state ────────────────────────────────────────────────────────
+  // ═══ Set visual state ════════════════════════════════════════════════════
   function setState(newState) {
     state = newState;
     orb.className = 'orb ' + stateNames[state];
@@ -182,6 +227,9 @@
     statusLabel.className = 'status-label ' + stateLabelClasses[state];
 
     switch (state) {
+      case State.SLEEPING:
+        orbIcon.innerHTML = '<circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" opacity="0.3"/><path d="M17 6l-10 10M7 6l10 10"/>';
+        break;
       case State.LISTENING:
         orbIcon.innerHTML = '<path d="M12 14a4 4 0 0 0 4-4V6a4 4 0 0 0-8 0v4a4 4 0 0 0 4 4z"/><path d="M19 10a7 7 0 0 1-14 0"/>';
         break;
@@ -197,7 +245,44 @@
     }
   }
 
-  // ─── Wave animation ──────────────────────────────────────────────────────────
+  // ═══ Idle timeout ════════════════════════════════════════════════════════
+  function resetIdleTimer() {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (wakeWordEnabled && (state === State.LISTENING || state === State.RESPONDING)) {
+      idleTimer = setTimeout(goToSleep, IDLE_TIMEOUT_MS);
+    }
+  }
+
+  function goToSleep() {
+    if (!wakeWordEnabled) return;
+    cancelCurrentResponse();
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      try { mediaRecorder.stop(); } catch(e) {}
+    }
+    setState(State.SLEEPING);
+    pauseVAD();
+    hintText.textContent = 'Di "Computer" para activarme';
+  }
+
+  function onWakeWord() {
+    if (state !== State.SLEEPING) return;
+    showWakeBadge(true);
+    setTimeout(() => showWakeBadge(false), 1500);
+    setState(State.LISTENING);
+    resumeVAD();
+    resetIdleTimer();
+    hintText.textContent = 'Te escucho...';
+  }
+
+  function toggleSleep() {
+    if (state === State.SLEEPING) {
+      onWakeWord();
+    } else if (state === State.LISTENING) {
+      goToSleep();
+    }
+  }
+
+  // ═══ Wave animation ═══════════════════════════════════════════════════════
   function updateWave(level) {
     if (state !== State.SPEAKING && state !== State.LISTENING) {
       waveBars.classList.remove('active');
@@ -225,7 +310,7 @@
     tick();
   }
 
-  // ─── Transcript ──────────────────────────────────────────────────────────────
+  // ═══ Transcript ═══════════════════════════════════════════════════════════
   function showTranscript(hermesText, sttText) {
     let html = `<div><span class="label">Hermes:</span> <span class="response-text">${hermesText}</span></div>`;
     if (sttText) html += `<span class="stt-text">«${sttText}»</span>`;
@@ -235,9 +320,16 @@
     transcript._timeout = setTimeout(() => transcript.classList.remove('visible'), 15000);
   }
 
-  // ─── Barge-in ────────────────────────────────────────────────────────────────
+  function showSTT(text) {
+    transcript.innerHTML = `<span class="stt-text">«${text}»</span>`;
+    transcript.classList.add('visible');
+  }
+
+  // ═══ Wake word badges ════════════════════════════════════════════════════
+  function showWakeBadge(show) { wakeBadge.classList.toggle('show', show); }
   function showBargein(show) { bargeinBadge.classList.toggle('show', show); }
 
+  // ═══ Cancel response ═════════════════════════════════════════════════════
   function cancelCurrentResponse() {
     if (abortController) { try { abortController.abort(); } catch(e) {} abortController = null; }
     if (currentAudio) {
@@ -245,7 +337,7 @@
     }
   }
 
-  // ─── Recording ───────────────────────────────────────────────────────────────
+  // ═══ Recording ═══════════════════════════════════════════════════════════
   function startRecording() {
     if (state === State.SPEAKING) return;
     if (!stream) return;
@@ -272,9 +364,9 @@
     if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
   }
 
-  // ─── Send audio (streaming) ──────────────────────────────────────────────────
+  // ═══ Send audio ══════════════════════════════════════════════════════════
   async function sendAudio() {
-    if (audioChunks.length === 0) { setState(State.LISTENING); return; }
+    if (audioChunks.length === 0) { setState(State.LISTENING); resetIdleTimer(); return; }
     setState(State.PROCESSING);
 
     const blob = new Blob(audioChunks, { type: 'audio/webm' });
@@ -290,10 +382,10 @@
         const err = await resp.json().catch(() => ({}));
         showTranscript(err.error || `Error ${resp.status}`);
         setState(State.LISTENING);
+        resetIdleTimer();
         return;
       }
 
-      // Store session ID from response (in case server created new one)
       const respSessionId = resp.headers.get('X-Session-ID');
 
       const responseText = resp.headers.get('X-Response-Text');
@@ -306,17 +398,13 @@
       if (e.name === 'AbortError') return; // barge-in
       showTranscript('Error de conexión');
       setState(State.LISTENING);
+      resetIdleTimer();
     } finally {
       abortController = null;
     }
   }
 
-  function showSTT(text) {
-    transcript.innerHTML = `<span class="stt-text">«${text}»</span>`;
-    transcript.classList.add('visible');
-  }
-
-  // ─── Streaming audio playback with MediaSource ──────────────────────────────
+  // ═══ Streaming audio playback ════════════════════════════════════════════
   function playStreamingAudio(response, responseText, sttText) {
     return new Promise((resolve) => {
       // Try MediaSource first
@@ -370,8 +458,18 @@
         audio.play().catch(() => {});
       };
 
-      audio.onended = () => { URL.revokeObjectURL(audio.src); currentAudio = null; setState(State.LISTENING); resolve(); };
-      audio.onerror = () => { URL.revokeObjectURL(audio.src); currentAudio = null; setState(State.LISTENING); resolve(); };
+      audio.onended = () => {
+        URL.revokeObjectURL(audio.src); currentAudio = null;
+        setState(State.LISTENING);
+        resetIdleTimer();
+        resolve();
+      };
+      audio.onerror = () => {
+        URL.revokeObjectURL(audio.src); currentAudio = null;
+        setState(State.LISTENING);
+        resetIdleTimer();
+        resolve();
+      };
     });
   }
 
@@ -396,18 +494,19 @@
     }
     const blob = new Blob(allChunks, { type: 'audio/mpeg' });
     const url = URL.createObjectURL(blob);
-    const audio = new Audio(url);
+    const audio = new Audio();
     currentAudio = audio;
     audio.oncanplay = () => {
       setState(State.RESPONDING);
       if (responseText) showTranscript(responseText, sttText);
       audio.play().catch(() => {});
     };
-    audio.onended = () => { URL.revokeObjectURL(url); currentAudio = null; setState(State.LISTENING); };
-    audio.onerror = () => { URL.revokeObjectURL(url); currentAudio = null; setState(State.LISTENING); };
+    audio.onended = () => { URL.revokeObjectURL(url); currentAudio = null; setState(State.LISTENING); resetIdleTimer(); };
+    audio.onerror = () => { URL.revokeObjectURL(url); currentAudio = null; setState(State.LISTENING); resetIdleTimer(); };
+    audio.src = url;
   }
 
-  // ─── Silero VAD ────────────────────────────────────────────────────────────
+  // ═══ Silero VAD ══════════════════════════════════════════════════════════
   async function initVAD(micStream) {
     if (typeof VAD === 'undefined') throw new Error('VAD library not loaded');
 
@@ -425,13 +524,8 @@
     });
 
     vadClient = vad;
-    vad.start(micStream);
+    // Don't start VAD yet — will start in SLEEPING or LISTENING
 
-    // VAD keeps the mic stream alive during RESPONDING for barge-in
-    // But VAD pauses during SPEAKING (we don't want echo detection)
-    // We handle this by pausing/resuming VAD
-
-    hintText.textContent = 'Habla naturalmente — Silero VAD activo';
     return vad;
   }
 
@@ -443,7 +537,7 @@
     if (vadClient && vadClient.resume) vadClient.resume();
   }
 
-  // ─── Fallback VAD (RMS-based) ─────────────────────────────────────────────
+  // ═══ Fallback VAD (RMS-based) ═══════════════════════════════════════════
   function startBasicVAD() {
     if (!analyser) return;
     vadFailed = true;
@@ -459,6 +553,8 @@
 
     function tick() {
       requestAnimationFrame(tick);
+      if (state === State.SLEEPING) { loudFrames = 0; silentFrames = 0; return; }
+
       analyser.getFloatTimeDomainData(buffer);
       let sum = 0;
       for (let i = 0; i < buffer.length; i++) sum += buffer[i] * buffer[i];
@@ -484,7 +580,47 @@
     tick();
   }
 
-  // ─── Health check ────────────────────────────────────────────────────────────
+  // ═══ Porcupine Wake Word ════════════════════════════════════════════════
+  async function initWakeWord(micStream) {
+    if (!PICOVOICE_ACCESS_KEY) {
+      hintText.textContent = 'Sin wake word (falta PICOVOICE_ACCESS_KEY)';
+      return false;
+    }
+    if (window._porcupineFailed) {
+      hintText.textContent = 'Wake word no disponible (CDN falló)';
+      return false;
+    }
+
+    const PorcupineWeb = window.PorcupineWeb;
+    const WebVoiceProcessor = window.WebVoiceProcessor;
+    if (!PorcupineWeb || !WebVoiceProcessor) {
+      hintText.textContent = 'Wake word no disponible (librería no cargada)';
+      return false;
+    }
+
+    try {
+      hintText.textContent = 'Cargando wake word...';
+
+      porcupineEngine = await PorcupineWeb.create({
+        accessKey: PICOVOICE_ACCESS_KEY,
+        keywords: [{ label: 'computer', sensitivity: 0.5 }],
+      });
+
+      webVoiceProcessor = await WebVoiceProcessor.create({
+        engines: [porcupineEngine],
+        streams: [micStream],
+      });
+
+      porcupineEngine.on('detection', () => onWakeWord());
+      return true;
+    } catch (e) {
+      console.warn('Porcupine wake word failed:', e);
+      hintText.textContent = 'Wake word desactivado: ' + e.message;
+      return false;
+    }
+  }
+
+  // ═══ Health check ════════════════════════════════════════════════════════
   async function checkHealth() {
     try {
       const r = await fetch('/api/health');
@@ -493,7 +629,7 @@
     } catch { connBadge.innerHTML = '✗ sin conexion'; }
   }
 
-  // ─── Init ────────────────────────────────────────────────────────────────────
+  // ═══ Init ════════════════════════════════════════════════════════════════
   async function init() {
     // Health check
     checkHealth();
@@ -524,6 +660,9 @@
     source.connect(analyser);
     startWaveVisualization();
 
+    // Try wake word first (needs mic stream)
+    wakeWordEnabled = await initWakeWord(stream);
+
     // Try Silero VAD with timeout
     try {
       const vadPromise = initVAD(stream);
@@ -531,40 +670,83 @@
         setTimeout(() => reject(new Error('VAD timeout')), 20000)
       );
       await Promise.race([vadPromise, timeoutPromise]);
-      connBadge.innerHTML = '✓ <span class="ok">Silero VAD</span>';
-      setState(State.LISTENING);
+
+      if (wakeWordEnabled) {
+        connBadge.innerHTML = '✓ <span class="ok">Silero VAD + wake</span>';
+        setState(State.SLEEPING);
+        hintText.textContent = 'Di "Computer" para activarme';
+      } else {
+        connBadge.innerHTML = '✓ <span class="ok">Silero VAD</span>';
+        setState(State.LISTENING);
+        hintText.textContent = 'Habla naturalmente — Silero VAD activo';
+        resumeVAD();
+      }
     } catch (e) {
       console.warn('Silero VAD failed:', e);
       connBadge.innerHTML = '⚠ <span class="ok">VAD básico</span>';
       startBasicVAD();
-      setState(State.LISTENING);
+      if (wakeWordEnabled) {
+        setState(State.SLEEPING);
+      } else {
+        setState(State.LISTENING);
+      }
     }
   }
 
-  // ─── Click orb ──────────────────────────────────────────────────────────────
+  // ═══ Click orb ═══════════════════════════════════════════════════════════
   orb.addEventListener('click', () => {
-    if (state === State.LISTENING) startRecording();
-    else if (state === State.SPEAKING) stopRecording();
-    else if (state === State.RESPONDING) {
-      showBargein(true); cancelCurrentResponse(); setTimeout(() => showBargein(false), 2000);
-      setState(State.LISTENING);
+    switch (state) {
+      case State.SLEEPING:
+        onWakeWord();
+        break;
+      case State.LISTENING:
+        if (wakeWordEnabled) goToSleep();
+        else startRecording();
+        break;
+      case State.SPEAKING:
+        stopRecording();
+        break;
+      case State.RESPONDING:
+        showBargein(true); cancelCurrentResponse(); setTimeout(() => showBargein(false), 2000);
+        setState(State.LISTENING);
+        resetIdleTimer();
+        break;
+      case State.PROCESSING:
+        // Can't cancel processing
+        break;
     }
   });
 
-  // Override setState to pause/resume VAD for barge-in
+  // ═══ Keyboard shortcuts ══════════════════════════════════════════════════
+  document.addEventListener('keydown', (e) => {
+    if (e.key === ' ' && e.target === document.body) {
+      e.preventDefault();
+      if (state === State.LISTENING || state === State.SLEEPING) {
+        if (state === State.SLEEPING) onWakeWord();
+        else startRecording();
+      } else if (state === State.SPEAKING) {
+        stopRecording();
+      }
+    }
+    if (e.key === 'Escape') {
+      cancelCurrentResponse();
+      if (wakeWordEnabled && state !== State.SLEEPING) goToSleep();
+    }
+  });
+
+  // ═══ Override setState for VAD + idle timer ══════════════════════════════
   const origSetState = setState;
   setState = function(newState) {
     origSetState(newState);
     // Pause VAD during speaking/processing to avoid echo feedback
-    if (newState === State.SPEAKING || newState === State.PROCESSING) {
+    if (newState === State.SPEAKING || newState === State.PROCESSING || newState === State.SLEEPING) {
       pauseVAD();
     } else if (newState === State.LISTENING || newState === State.RESPONDING) {
-      // Keep VAD active during RESPONDING for barge-in
       resumeVAD();
     }
   };
 
-  // ─── Start ──────────────────────────────────────────────────────────────────
+  // ═══ Start ═══════════════════════════════════════════════════════════════
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
