@@ -41,6 +41,9 @@ SERVER_PID=$!
 for i in $(seq 1 10); do
     if curl -s -o /dev/null http://localhost:3000/api/health 2>/dev/null; then
         echo "✓ Servidor listo en http://localhost:3000"
+        # Notificación Windows
+        powershell.exe -Command "New-BurntToastNotification -AppLogo '\\wsl.localhost\Ubuntu\mnt\d\PROCESO\callhermes\public\favicon.ico' -Text 'CallHermes', 'Servidor listo en localhost:3000'" 2>/dev/null || \
+        powershell.exe -Command "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]::CreateToastNotifier('CallHermes').Show((New-Object Windows.Data.Xml.Dom.XmlDocument).LoadXml('<toast><visual><binding template=\"ToastText02\"><text id=\"1\">CallHermes</text><text id=\"2\">Servidor listo en localhost:3000</text></binding></visual></toast>'))" 2>/dev/null || true
         break
     fi
     sleep 1
