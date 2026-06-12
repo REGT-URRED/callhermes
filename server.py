@@ -4,14 +4,18 @@ CallHermes — Backend para agente de voz en tiempo real.
 Flujo:
   1. Browser detecta voz (VAD) → envía audio por POST
   2. Whisper transcribe → texto
-  3. Hermes API Server procesa (con historial de conversación)
+  3. Hermes API Server procesa (con historial de conversación por sesión)
   4. Edge TTS sintetiza respuesta en streaming
   5. Browser reproduce audio progresivamente
 
 Mejoras implementadas:
-  - Historial de conversación entre turnos
+  - Historial de conversación entre turnos (por sesión)
   - Streaming de audio (edge-tts Python API, chunked HTTP)
   - Preparado para barge-in (cabecera permite cancelación)
+  - Type hints en toda la base de código
+  - Timeouts configurables por servicio
+  - Validación de formato y tamaño de audio
+  - Graceful shutdown
 """
 
 import os
@@ -20,8 +24,12 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List, AsyncGenerator
+from dataclasses import dataclass, field
+from uuid import uuid4
 
+import aiohttp
+import edge_tts
 from dotenv import load_dotenv
 from aiohttp import web
 
@@ -35,12 +43,52 @@ PORT = int(os.getenv("PORT", "3000"))
 HERMES_API_URL = os.getenv("HERMES_API_URL", "http://localhost:8642/v1")
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
+HERMES_TIMEOUT = int(os.getenv("HERMES_TIMEOUT", "60"))
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "int8")
 
 TTS_VOICE = os.getenv("TTS_VOICE", "es-AR-ElenaNeural")
+TTS_TIMEOUT = int(os.getenv("TTS_TIMEOUT", "120"))
+
+MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+MIN_AUDIO_BYTES = int(os.getenv("MIN_AUDIO_BYTES", "100"))
+ALLOWED_AUDIO_TYPES = {"audio/webm", "audio/wav", "audio/wave", "audio/ogg", "audio/opus", "audio/mpeg", "audio/mp4"}
+
+# ─── Tipos ───────────────────────────────────────────────────────────────────
+
+@dataclass
+class Turn:
+    """Un intercambio usuario-asistente."""
+    user: str = ""
+    assistant: str = ""
+
+
+@dataclass
+class Session:
+    """Estado de una conversación."""
+    id: str = ""
+    turns: List[Turn] = field(default_factory=list)
+    max_turns: int = 10
+
+    def to_messages(self, system_prompt: str) -> List[Dict[str, str]]:
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        for t in self.turns:
+            messages.append({"role": "user", "content": t.user})
+            if t.assistant:
+                messages.append({"role": "assistant", "content": t.assistant})
+        return messages
+
+    def add_turn(self, user_text: str) -> None:
+        self.turns.append(Turn(user=user_text))
+        if len(self.turns) > self.max_turns:
+            self.turns = self.turns[-self.max_turns:]
+
+    def set_assistant_response(self, text: str) -> None:
+        if self.turns and not self.turns[-1].assistant:
+            self.turns[-1].assistant = text
+
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -65,67 +113,105 @@ async def get_whisper():
         if _whisper is not None:
             return _whisper
         log.info("Cargando Whisper modelo '%s' (dispositivo: %s)...", WHISPER_MODEL, WHISPER_DEVICE)
-        from faster_whisper import WhisperModel
-        _whisper = WhisperModel(
-            WHISPER_MODEL,
-            device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE,
-        )
-        log.info("Whisper listo")
+        try:
+            from faster_whisper import WhisperModel
+            _whisper = WhisperModel(
+                WHISPER_MODEL,
+                device=WHISPER_DEVICE,
+                compute_type=WHISPER_COMPUTE,
+            )
+            log.info("Whisper listo")
+        except Exception as e:
+            log.error("Error cargando Whisper: %s", e)
+            raise
         return _whisper
 
 
-# ─── Historial de conversación ────────────────────────────────────────────────
-
-MAX_HISTORY_TURNS = 10  # 10 intercambios usuario-asistente = 20 mensajes
-
-conversation_history: list[dict] = []
-history_lock = asyncio.Lock()
-
-
-async def get_system_prompt() -> str:
-    return (
-        "Eres Hermes, un asistente de voz en español. "
-        "Responde de forma clara, concisa y natural como en una conversación hablada. "
-        "Si ejecutas herramientas en la computadora, informa brevemente qué hiciste.\n\n"
-        "REGLAS DE CONVERSACIÓN:\n"
-        "1. Escucha activa: cuando el usuario termine de hablar, "
-        "pregunta '¿Algo más?' o '¿Es todo?' antes de finalizar.\n"
-        "2. No ejecutes ninguna acción hasta que el usuario diga 'procede'.\n"
-        "3. Cuando el usuario diga 'procede', entonces sí ejecuta todo lo solicitado.\n"
-        "4. Tus respuestas deben ser naturales y conversacionales.\n"
-        "5. Si no entiendes algo, pide aclaración.\n"
-        "6. Mantén el contexto de la conversación.\n"
-        "7. Sé proactivo pero no ejecutes sin autorización ('procede')."
-    )
+async def release_whisper() -> None:
+    """Libera recursos de Whisper en shutdown."""
+    global _whisper
+    if _whisper is not None:
+        try:
+            del _whisper
+        except Exception:
+            pass
+        _whisper = None
+        log.info("Whisper liberado")
 
 
-async def build_messages(user_text: str) -> list[dict]:
-    """Construye la lista de mensajes con historial."""
-    global conversation_history
+# ─── Sesiones de conversación ────────────────────────────────────────────────
 
-    # Agregar mensaje del usuario actual
-    conversation_history.append({"role": "user", "content": user_text})
+_sessions: Dict[str, Session] = {}
+_sessions_lock = asyncio.Lock()
 
-    # Limitar historial
-    if len(conversation_history) > MAX_HISTORY_TURNS * 2:
-        conversation_history = conversation_history[-(MAX_HISTORY_TURNS * 2):]
+SYSTEM_PROMPT = (
+    "Eres Hermes, un asistente de voz en español. "
+    "Responde de forma clara, concisa y natural como en una conversación hablada. "
+    "Si ejecutas herramientas en la computadora, informa brevemente qué hiciste.\n\n"
+    "REGLAS DE CONVERSACIÓN:\n"
+    "1. Escucha activa: cuando el usuario termine de hablar, "
+    "pregunta '¿Algo más?' o '¿Es todo?' antes de finalizar.\n"
+    "2. No ejecutes ninguna acción hasta que el usuario diga 'procede'.\n"
+    "3. Cuando el usuario diga 'procede', entonces sí ejecuta todo lo solicitado.\n"
+    "4. Tus respuestas deben ser naturales y conversacionales.\n"
+    "5. Si no entiendes algo, pide aclaración.\n"
+    "6. Mantén el contexto de la conversación.\n"
+    "7. Sé proactivo pero no ejecutes sin autorización ('procede')."
+)
 
-    messages = [
-        {"role": "system", "content": await get_system_prompt()},
-        *conversation_history,
-    ]
-    return messages
+
+async def get_or_create_session(session_id: Optional[str] = None) -> Session:
+    """Obtiene o crea una sesión por ID. Si no se provee ID, crea una nueva."""
+    async with _sessions_lock:
+        if session_id and session_id in _sessions:
+            return _sessions[session_id]
+        new_id = session_id or str(uuid4())
+        session = Session(id=new_id)
+        _sessions[new_id] = session
+        log.info("Nueva sesión: %s", new_id)
+        return session
 
 
-async def add_assistant_response(text: str):
-    """Guarda la respuesta del asistente en el historial."""
-    global conversation_history
-    if conversation_history and conversation_history[-1]["role"] == "assistant":
-        return
-    conversation_history.append({"role": "assistant", "content": text})
-    if len(conversation_history) > MAX_HISTORY_TURNS * 2:
-        conversation_history = conversation_history[-(MAX_HISTORY_TURNS * 2):]
+async def build_messages(session: Session, user_text: str) -> List[Dict[str, str]]:
+    """Agrega el mensaje del usuario a la sesión y construye la lista de mensajes."""
+    session.add_turn(user_text)
+    return session.to_messages(SYSTEM_PROMPT)
+
+
+async def add_assistant_response(session: Session, text: str) -> None:
+    """Guarda la respuesta del asistente en la sesión."""
+    async with _sessions_lock:
+        session.set_assistant_response(text)
+
+
+# ─── Validación de audio ─────────────────────────────────────────────────────
+
+
+def validate_audio(audio_data: bytes, content_type: str) -> Optional[str]:
+    """Valida formato y tamaño del audio. Retorna mensaje de error o None."""
+    if not audio_data:
+        return "audio vacío"
+    if len(audio_data) < MIN_AUDIO_BYTES:
+        return f"audio demasiado pequeño ({len(audio_data)} < {MIN_AUDIO_BYTES} bytes)"
+    if len(audio_data) > MAX_AUDIO_BYTES:
+        return f"audio demasiado grande ({len(audio_data)} > {MAX_AUDIO_BYTES} bytes)"
+    if content_type and content_type not in ALLOWED_AUDIO_TYPES:
+        log.warning("Content-Type no esperado: %s (se intentará igual)", content_type)
+    return None
+
+
+def detect_extension(content_type: str) -> str:
+    """Detecta extensión de archivo según content-type."""
+    ct = content_type.lower()
+    if "wav" in ct:
+        return ".wav"
+    if "ogg" in ct:
+        return ".ogg"
+    if "mpeg" in ct or "mp3" in ct:
+        return ".mp3"
+    if "mp4" in ct:
+        return ".mp4"
+    return ".webm"  # default
 
 
 # ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -138,6 +224,8 @@ async def handle_health(request: web.Request) -> web.Response:
         "service": "callhermes",
         "version": "2.0.0",
         "hermes_api": HERMES_API_URL,
+        "whisper_loaded": _whisper is not None,
+        "active_sessions": len(_sessions),
     })
 
 
@@ -148,91 +236,96 @@ async def handle_audio(request: web.Request) -> web.StreamResponse:
 
     Permite barge-in: si el frontend cierra la conexión, el servidor
     detecta y aborta el procesamiento.
+
+    Soporta sesiones via X-Session-ID header.
     """
     content_type = request.content_type or ""
 
-    # ── 1. Extraer audio del request ───────────────────────────────────
-    if "multipart" in content_type:
-        try:
+    # ── 1. Obtener/crear sesión ─────────────────────────────────────────
+    session_id = request.headers.get("X-Session-ID")
+    session = await get_or_create_session(session_id)
+
+    # ── 2. Extraer audio del request ────────────────────────────────────
+    try:
+        if "multipart" in content_type:
             reader = await request.multipart()
             part = await reader.next()
             if part is None:
                 return web.json_response({"error": "no se recibió audio"}, status=400)
             audio_data = await part.read()
-        except (ValueError, AssertionError, Exception) as e:
-            log.warning("Error leyendo multipart: %s", e)
-            return web.json_response({"error": f"formato multipart inválido: {e}"}, status=400)
-    else:
-        audio_data = await request.read()
+            detected_type = part.headers.get("Content-Type", "audio/webm")
+        else:
+            audio_data = await request.read()
+            detected_type = content_type or "audio/webm"
+    except (ValueError, AssertionError, Exception) as e:
+        log.warning("Error leyendo audio: %s", e)
+        return web.json_response({"error": f"formato inválido: {e}"}, status=400)
 
-    if not audio_data or len(audio_data) < 100:
-        return web.json_response({"error": "audio demasiado pequeño o vacío"}, status=400)
+    # ── 3. Validar audio ────────────────────────────────────────────────
+    validation_error = validate_audio(audio_data, detected_type)
+    if validation_error:
+        log.warning("Audio inválido: %s", validation_error)
+        # Si es muy pequeño, podría ser silencio — no es error grave
+        if len(audio_data) < 100:
+            return web.json_response({"error": "audio vacío o silencio"}, status=400)
+        return web.json_response({"error": validation_error}, status=400)
 
-    # Detectar extensión según content-type
-    if "multipart" in content_type and part is not None:
-        detected_type = part.headers.get("Content-Type", "audio/webm")
-    else:
-        detected_type = content_type or "audio/webm"
-
-    ext = ".webm"
-    if "wav" in detected_type:
-        ext = ".wav"
-    elif "ogg" in detected_type:
-        ext = ".ogg"
-
+    ext = detect_extension(detected_type)
     tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-    tmp.write(audio_data)
     tmp_path = tmp.name
-    tmp.close()
+    try:
+        tmp.write(audio_data)
+    finally:
+        tmp.close()
 
-    log.info("Audio recibido: %d bytes → %s", len(audio_data), tmp_path)
+    log.info("Audio recibido: %d bytes → %s (sesión: %s)", len(audio_data), tmp_path, session.id)
 
     try:
-        # ── 2. Transcripción con Whisper ──────────────────────────────
+        # ── 4. Transcripción con Whisper ────────────────────────────────
         whisper = await get_whisper()
         segments, info = whisper.transcribe(tmp_path, language="es")
         text = " ".join(seg.text for seg in segments).strip()
 
         if not text:
-            log.warning("No se detectó voz en el audio")
+            log.warning("No se detectó voz en el audio (sesión: %s)", session.id)
             return web.json_response({"error": "no se detectó voz"}, status=400)
 
-        log.info("STT: %r", text)
+        log.info("STT [%s]: %r", session.id, text)
 
-        # ── 3. Consultar Hermes API Server (con historial) ────────────
-        async with history_lock:
-            messages = await build_messages(text)
+        # ── 5. Construir mensajes con historial ──────────────────────────
+        messages = await build_messages(session, text)
 
-        # Hacer la llamada a Hermes
+        # ── 6. Consultar Hermes API Server ───────────────────────────────
         response_text = await ask_hermes(messages)
 
-        # Guardar respuesta en historial
-        async with history_lock:
-            await add_assistant_response(response_text)
+        # ── 7. Guardar respuesta en historial ────────────────────────────
+        await add_assistant_response(session, response_text)
 
-        log.info("Hermes: %r", response_text[:100])
+        log.info("Hermes [%s]: %r", session.id, response_text[:100])
 
-        # ── 4. Streaming de TTS ───────────────────────────────────────
+        # ── 8. Streaming de TTS ─────────────────────────────────────────
         resp = web.StreamResponse(
             status=200,
             headers={
                 "Content-Type": "audio/mpeg",
                 "X-Response-Text": response_text[:200].replace("\n", " "),
                 "X-Transcript": text[:200].replace("\n", " "),
+                "X-Session-ID": session.id,
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
             }
         )
         await resp.prepare(request)
 
-        # Enviar chunks de audio en streaming
-        async for chunk in synthesize_stream(response_text):
-            try:
-                await resp.write(chunk)
-            except (ConnectionResetError, ConnectionAbortedError, Exception):
-                # Cliente desconectado (barge-in) — dejar de enviar
-                log.info("Cliente desconectado durante streaming (posible barge-in)")
-                break
+        try:
+            async for chunk in synthesize_stream(response_text):
+                try:
+                    await resp.write(chunk)
+                except (ConnectionResetError, ConnectionAbortedError):
+                    log.info("Barge-in detectado (sesión: %s)", session.id)
+                    break
+        except asyncio.TimeoutError:
+            log.warning("TTS timeout (sesión: %s)", session.id)
 
         try:
             await resp.write_eof()
@@ -254,13 +347,27 @@ async def handle_options(request: web.Request) -> web.Response:
     return web.Response(headers=cors_headers())
 
 
+async def handle_reset(request: web.Request) -> web.Response:
+    """Resetea el historial de una sesión. Si no se provee ID, resetea todas."""
+    session_id = request.headers.get("X-Session-ID")
+    async with _sessions_lock:
+        if session_id and session_id in _sessions:
+            _sessions[session_id] = Session(id=session_id)
+            log.info("Sesión reiniciada: %s", session_id)
+            return web.json_response({"status": "ok", "message": f"sesión {session_id} reiniciada"})
+        elif session_id:
+            return web.json_response({"error": "sesión no encontrada"}, status=404)
+        else:
+            _sessions.clear()
+            log.info("Todas las sesiones reiniciadas")
+            return web.json_response({"status": "ok", "message": "todas las sesiones reiniciadas"})
+
+
 # ─── Llamada a Hermes API Server ──────────────────────────────────────────────
 
 
-async def ask_hermes(messages: list[dict]) -> str:
+async def ask_hermes(messages: List[Dict[str, str]]) -> str:
     """Envía los mensajes (con historial) a Hermes API Server."""
-    import aiohttp
-
     headers = {
         "Authorization": f"Bearer {HERMES_API_KEY}",
         "Content-Type": "application/json",
@@ -273,33 +380,38 @@ async def ask_hermes(messages: list[dict]) -> str:
         "stream": False,
     }
 
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=HERMES_TIMEOUT)
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
-            f"{HERMES_API_URL}/chat/completions",
-            json=payload,
-            headers=headers,
-        ) as resp:
-            if resp.status != 200:
-                error_body = await resp.text()
-                log.error("Hermes API error %d: %s", resp.status, error_body)
-                return f"Lo siento, hubo un error al procesar tu solicitud (código {resp.status})."
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as client:
+            async with client.post(
+                f"{HERMES_API_URL}/chat/completions",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                if resp.status != 200:
+                    error_body = await resp.text()
+                    log.error("Hermes API error %d: %s", resp.status, error_body)
+                    return f"Lo siento, hubo un error al procesar tu solicitud (código {resp.status})."
 
-            data = await resp.json()
-            return data["choices"][0]["message"]["content"]
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+    except asyncio.TimeoutError:
+        log.error("Hermes API timeout después de %ds", HERMES_TIMEOUT)
+        return "Lo siento, la solicitud tardó demasiado. Intenta de nuevo."
+    except aiohttp.ClientError as e:
+        log.error("Hermes API connection error: %s", e)
+        return "Lo siento, no pude conectar con el servidor de procesamiento."
 
 
 # ─── Síntesis de voz (streaming) ──────────────────────────────────────────────
 
 
-async def synthesize_stream(text: str):
+async def synthesize_stream(text: str) -> AsyncGenerator[bytes, None]:
     """
     Genera audio MP3 desde edge-tts en streaming.
     Retorna chunks de bytes de audio.
     """
-    import edge_tts
-
     communicate = edge_tts.Communicate(text, TTS_VOICE)
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
@@ -309,11 +421,11 @@ async def synthesize_stream(text: str):
 # ─── Utilidades ───────────────────────────────────────────────────────────────
 
 
-def cors_headers():
+def cors_headers() -> Dict[str, str]:
     return {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Response-Text, X-Transcript",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Response-Text, X-Transcript, X-Session-ID",
     }
 
 
@@ -372,16 +484,29 @@ async def cors_middleware(request: web.Request, handler):
     return response
 
 
-# ─── Endpoint para resetear historial ─────────────────────────────────────────
+# ─── Graceful shutdown ───────────────────────────────────────────────────────
 
 
-async def handle_reset(request: web.Request) -> web.Response:
-    """Resetea el historial de conversación."""
-    global conversation_history
-    async with history_lock:
-        conversation_history = []
-    log.info("Historial de conversación reiniciado")
-    return web.json_response({"status": "ok", "message": "historial reiniciado"})
+async def on_shutdown(app):
+    """Limpieza de recursos al detener el servidor."""
+    log.info("Apagando servidor...")
+    await release_whisper()
+    async with _sessions_lock:
+        _sessions.clear()
+    log.info("Sesiones liberadas")
+
+
+async def on_startup(app):
+    """Log de inicio."""
+    log.info("─" * 50)
+    log.info("  CallHermes v2.0.0")
+    log.info("  Servidor: http://%s:%s", HOST, PORT)
+    log.info("  Hermes API: %s", HERMES_API_URL)
+    log.info("  Whisper: %s (%s / %s)", WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE)
+    log.info("  TTS: %s (streaming)", TTS_VOICE)
+    log.info("  Timeouts: Hermes=%ds TTS=%ds", HERMES_TIMEOUT, TTS_TIMEOUT)
+    log.info("  Max audio: %d MB", MAX_AUDIO_BYTES // (1024 * 1024))
+    log.info("─" * 50)
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
@@ -397,21 +522,10 @@ def create_app() -> web.Application:
     app.router.add_post("/api/reset", handle_reset)
     app.router.add_route("OPTIONS", "/api/audio", handle_options)
 
-    # Loop startup
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
 
     return app
-
-
-async def on_startup(app):
-    log.info("─" * 50)
-    log.info("  CallHermes v2.0.0")
-    log.info("  Servidor: http://%s:%s", HOST, PORT)
-    log.info("  Hermes API: %s", HERMES_API_URL)
-    log.info("  Whisper: %s (%s)", WHISPER_MODEL, WHISPER_DEVICE)
-    log.info("  TTS: %s (streaming)", TTS_VOICE)
-    log.info("  Historial: %d turnos máx", MAX_HISTORY_TURNS)
-    log.info("─" * 50)
 
 
 if __name__ == "__main__":

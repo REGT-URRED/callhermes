@@ -168,6 +168,7 @@
   let vadClient = null;
   let vadFailed = false;
   let silenceTimer = null;
+  const sessionId = crypto.randomUUID();
 
   // Audio context for wave visualization
   let audioCtx = null;
@@ -282,6 +283,7 @@
     try {
       const resp = await fetch('/api/audio', {
         method: 'POST', body: blob, signal: abortController.signal,
+        headers: { 'X-Session-ID': sessionId },
       });
 
       if (!resp.ok) {
@@ -290,6 +292,9 @@
         setState(State.LISTENING);
         return;
       }
+
+      // Store session ID from response (in case server created new one)
+      const respSessionId = resp.headers.get('X-Session-ID');
 
       const responseText = resp.headers.get('X-Response-Text');
       const sttText = resp.headers.get('X-Transcript');
