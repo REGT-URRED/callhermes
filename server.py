@@ -23,10 +23,14 @@ import json
 import asyncio
 import logging
 import tempfile
+import time
+import subprocess
 from pathlib import Path
 from typing import Optional, Dict, List, AsyncGenerator
 from dataclasses import dataclass, field
 from uuid import uuid4
+
+import numpy as np
 
 import aiohttp
 import edge_tts
@@ -45,9 +49,9 @@ HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
 HERMES_TIMEOUT = int(os.getenv("HERMES_TIMEOUT", "60"))
 
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "int8")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "")  # vacío = auto
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "")  # vacío = auto
+WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "")  # vacío = auto
 
 TTS_VOICE = os.getenv("TTS_VOICE", "es-AR-ElenaNeural")
 TTS_TIMEOUT = int(os.getenv("TTS_TIMEOUT", "120"))
@@ -55,6 +59,34 @@ TTS_TIMEOUT = int(os.getenv("TTS_TIMEOUT", "120"))
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 MIN_AUDIO_BYTES = int(os.getenv("MIN_AUDIO_BYTES", "100"))
 ALLOWED_AUDIO_TYPES = {"audio/webm", "audio/wav", "audio/wave", "audio/ogg", "audio/opus", "audio/mpeg", "audio/mp4"}
+
+# ─── Auto-configuración Whisper ──────────────────────────────────────────────
+
+
+def detect_whisper_config():
+    """Detecta GPU y ajusta configuración Whisper automáticamente."""
+    model = WHISPER_MODEL or "base"
+    device = WHISPER_DEVICE
+    compute = WHISPER_COMPUTE
+
+    if not device:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = "cuda"
+                compute = compute or "float16"
+                model = WHISPER_MODEL or "medium"
+                log.info("GPU detectada → Whisper %s en CUDA (%s)", model, compute)
+            else:
+                device = "cpu"
+                compute = compute or "int8"
+                log.info("GPU no disponible → Whisper %s en CPU (%s)", model, compute)
+        except ImportError:
+            device = "cpu"
+            compute = compute or "int8"
+            log.info("torch no disponible → Whisper %s en CPU (%s)", model, compute)
+
+    return model, device, compute or "int8"
 
 # ─── Tipos ───────────────────────────────────────────────────────────────────
 
@@ -102,29 +134,89 @@ log = logging.getLogger("callhermes")
 
 _whisper = None
 _whisper_lock = asyncio.Lock()
+_whisper_config = None
 
 
 async def get_whisper():
-    """Inicializa Whisper bajo demanda (primera llamada)."""
-    global _whisper
+    """Inicializa Whisper bajo demanda (primera llamada) con auto-configuración."""
+    global _whisper, _whisper_config
     if _whisper is not None:
         return _whisper
     async with _whisper_lock:
         if _whisper is not None:
             return _whisper
-        log.info("Cargando Whisper modelo '%s' (dispositivo: %s)...", WHISPER_MODEL, WHISPER_DEVICE)
+        model, device, compute = detect_whisper_config()
+        _whisper_config = (model, device, compute)
+        log.info("Cargando Whisper '%s' (%s / %s)...", model, device, compute)
         try:
             from faster_whisper import WhisperModel
-            _whisper = WhisperModel(
-                WHISPER_MODEL,
-                device=WHISPER_DEVICE,
-                compute_type=WHISPER_COMPUTE,
-            )
-            log.info("Whisper listo")
+            t0 = time.time()
+            _whisper = WhisperModel(model, device=device, compute_type=compute)
+            elapsed = time.time() - t0
+            log.info("Whisper listo en %.1fs", elapsed)
         except Exception as e:
             log.error("Error cargando Whisper: %s", e)
             raise
         return _whisper
+
+
+async def warmup_whisper():
+    """Precarga Whisper en startup para evitar cold start."""
+    try:
+        await get_whisper()
+        log.info("✓ Whisper precargado — sin cold start en primer request")
+    except Exception as e:
+        log.warning("Whisper warmup falló (se cargará bajo demanda): %s", e)
+
+
+async def transcribe_audio(audio_data: bytes) -> tuple[str, float]:
+    """Transcribe audio con Whisper, evita tempfile usando pipe a ffmpeg."""
+    import numpy as np
+
+    whisper = await get_whisper()
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'ffmpeg', '-i', 'pipe:0',
+            '-f', 'f32le', '-ac', '1', '-ar', '16000',
+            'pipe:1',
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(audio_data),
+            timeout=30,
+        )
+
+        if not stdout or len(stdout) < 640:
+            return "", 0.0
+
+        audio_array = np.frombuffer(stdout, dtype=np.float32)
+        t0 = time.time()
+        segments, info = whisper.transcribe(audio_array, language="es")
+        text = " ".join(seg.text for seg in segments).strip()
+        elapsed = time.time() - t0
+        return text, elapsed
+
+    except (subprocess.SubprocessError, asyncio.TimeoutError) as e:
+        log.warning("ffmpeg pipe falló, usando tempfile: %s", e)
+        # Fallback: tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".webm", delete=False)
+        tmp_path = tmp.name
+        try:
+            tmp.write(audio_data)
+        finally:
+            tmp.close()
+        try:
+            segments, info = whisper.transcribe(tmp_path, language="es")
+            text = " ".join(seg.text for seg in segments).strip()
+            return text, 0.0
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 async def release_whisper() -> None:
@@ -225,6 +317,11 @@ async def handle_health(request: web.Request) -> web.Response:
         "version": "2.0.0",
         "hermes_api": HERMES_API_URL,
         "whisper_loaded": _whisper is not None,
+        "whisper_config": {
+            "model": _whisper_config[0] if _whisper_config else None,
+            "device": _whisper_config[1] if _whisper_config else None,
+            "compute": _whisper_config[2] if _whisper_config else None,
+        } if _whisper_config else None,
         "active_sessions": len(_sessions),
     })
 
@@ -271,26 +368,18 @@ async def handle_audio(request: web.Request) -> web.StreamResponse:
         return web.json_response({"error": validation_error}, status=400)
 
     ext = detect_extension(detected_type)
-    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-    tmp_path = tmp.name
-    try:
-        tmp.write(audio_data)
-    finally:
-        tmp.close()
 
-    log.info("Audio recibido: %d bytes → %s (sesión: %s)", len(audio_data), tmp_path, session.id)
+    log.info("Audio recibido: %d bytes (sesión: %s)", len(audio_data), session.id)
 
     try:
-        # ── 4. Transcripción con Whisper ────────────────────────────────
-        whisper = await get_whisper()
-        segments, info = whisper.transcribe(tmp_path, language="es")
-        text = " ".join(seg.text for seg in segments).strip()
+        # ── 4. Transcripción con Whisper (en memoria) ────────────────────
+        text, stt_time = await transcribe_audio(audio_data)
 
         if not text:
             log.warning("No se detectó voz en el audio (sesión: %s)", session.id)
             return web.json_response({"error": "no se detectó voz"}, status=400)
 
-        log.info("STT [%s]: %r", session.id, text)
+        log.info("STT [%s] (%.2fs): %r", session.id, stt_time, text)
 
         # ── 5. Construir mensajes con historial ──────────────────────────
         messages = await build_messages(session, text)
@@ -335,11 +424,8 @@ async def handle_audio(request: web.Request) -> web.StreamResponse:
         return resp
 
     finally:
-        # Limpiar archivos temporales
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        # Si el fallback usó tempfile, limpiar aquí se maneja en transcribe_audio
+        pass
 
 
 async def handle_options(request: web.Request) -> web.Response:
@@ -497,16 +583,25 @@ async def on_shutdown(app):
 
 
 async def on_startup(app):
-    """Log de inicio."""
+    """Precarga servicios y log de inicio."""
     log.info("─" * 50)
     log.info("  CallHermes v2.0.0")
     log.info("  Servidor: http://%s:%s", HOST, PORT)
     log.info("  Hermes API: %s", HERMES_API_URL)
-    log.info("  Whisper: %s (%s / %s)", WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE)
     log.info("  TTS: %s (streaming)", TTS_VOICE)
     log.info("  Timeouts: Hermes=%ds TTS=%ds", HERMES_TIMEOUT, TTS_TIMEOUT)
     log.info("  Max audio: %d MB", MAX_AUDIO_BYTES // (1024 * 1024))
     log.info("─" * 50)
+
+    # Precargar Whisper (evita cold start en primer request)
+    await warmup_whisper()
+
+    # Mostrar configuración final de Whisper
+    if _whisper_config:
+        model, device, compute = _whisper_config
+        log.info("  Whisper: %s (%s / %s)", model, device, compute)
+    else:
+        log.warning("  Whisper: no cargado")
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
