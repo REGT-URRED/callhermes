@@ -8,11 +8,10 @@
 <!-- Silero VAD - UMD bundle via CDN -->
 <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.26/dist/bundle.min.js"></script>
 
-<!-- Porcupine Web (wake word) - carga diferida, fallback si falla -->
-<script src="https://cdn.jsdelivr.net/npm/@picovoice/porcupine-web@3.0.2/dist/web/iife/index.js"
-  onerror="window._porcupineFailed=true"></script>
-<script src="https://cdn.jsdelivr.net/npm/@picovoice/web-voice-processor@3.0.2/dist/iife/index.js"
-  onerror="window._porcupineFailed=true"></script>
+<!-- TensorFlow.js + Speech Commands (wake word gratuito) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/speech-commands@1.1.4/dist/speech-commands.min.js"
+  onerror="window._tfjsFailed=true"></script>
 
 <style>
   *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -285,11 +284,6 @@
 (function() {
   'use strict';
 
-  // ═══ CONFIGURACIÓN ═══════════════════════════════════════════════════════
-  // Obtén tu AccessKey gratis en https://console.picovoice.ai/
-  // Sin access key: wake word desactivado (modo siempre-escucha)
-  const PICOVOICE_ACCESS_KEY = ''; // ← PON TU KEY AQUÍ
-
   // ═══ DOM refs ════════════════════════════════════════════════════════════
   const orb          = document.getElementById('orb');
   const statusLabel  = document.getElementById('statusLabel');
@@ -345,9 +339,8 @@
   const sessionId = crypto.randomUUID();
 
   // Wake word state
-  let porcupineEngine = null;
-  let webVoiceProcessor = null;
-  let wakeWordEnabled = false;
+  let wakeRecognizer = null;
+  let wakeWordActive = false;
   let wakeWordReady = false;
   let idleTimer = null;
 
@@ -384,26 +377,28 @@
   // ═══ Idle timeout ════════════════════════════════════════════════════════
   function resetIdleTimer() {
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-    if (wakeWordEnabled && (state === State.LISTENING || state === State.RESPONDING)) {
+    if (wakeWordReady && (state === State.LISTENING || state === State.RESPONDING)) {
       idleTimer = setTimeout(goToSleep, IDLE_TIMEOUT_MS);
     }
   }
 
   function goToSleep() {
-    if (!wakeWordEnabled) return;
+    if (!wakeWordReady) return;
     cancelCurrentResponse();
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
       try { mediaRecorder.stop(); } catch(e) {}
     }
+    stopWakeWordListening();
     setState(State.SLEEPING);
     pauseVAD();
-    hintText.textContent = 'Di "Computer" para activarme';
+    hintText.textContent = 'Di "Yes" para activarme';
   }
 
   function onWakeWord() {
     if (state !== State.SLEEPING) return;
     showWakeBadge(true);
     setTimeout(() => showWakeBadge(false), 1500);
+    startWakeWordListening(false); // stop wake-only mode
     setState(State.LISTENING);
     resumeVAD();
     resetIdleTimer();
@@ -745,44 +740,66 @@
     tick();
   }
 
-  // ═══ Porcupine Wake Word ════════════════════════════════════════════════
-  async function initWakeWord(micStream) {
-    if (!PICOVOICE_ACCESS_KEY) {
-      hintText.textContent = 'Sin wake word (falta PICOVOICE_ACCESS_KEY)';
-      return false;
-    }
-    if (window._porcupineFailed) {
-      hintText.textContent = 'Wake word no disponible (CDN falló)';
-      return false;
-    }
+  // ═══ TF.js Wake Word ═════════════════════════════════════════
+  let wakeListeningActive = false;
 
-    const PorcupineWeb = window.PorcupineWeb;
-    const WebVoiceProcessor = window.WebVoiceProcessor;
-    if (!PorcupineWeb || !WebVoiceProcessor) {
-      hintText.textContent = 'Wake word no disponible (librería no cargada)';
+  async function initWakeWord() {
+    if (window._tfjsFailed || typeof speechCommands === 'undefined') {
+      hintText.textContent = 'Wake word no disponible (TF.js no cargado)';
       return false;
     }
 
     try {
-      hintText.textContent = 'Cargando wake word...';
-
-      porcupineEngine = await PorcupineWeb.create({
-        accessKey: PICOVOICE_ACCESS_KEY,
-        keywords: [{ label: 'computer', sensitivity: 0.5 }],
-      });
-
-      webVoiceProcessor = await WebVoiceProcessor.create({
-        engines: [porcupineEngine],
-        streams: [micStream],
-      });
-
-      porcupineEngine.on('detection', () => onWakeWord());
+      hintText.textContent = 'Cargando modelo wake word...';
+      const base = 'https://cdn.jsdelivr.net/npm/@tensorflow-models/speech-commands@1.1.4/';
+      wakeRecognizer = speechCommands.create('BROWSER_Fft', undefined, base);
+      await wakeRecognizer.ensureModelLoaded();
+      const labels = wakeRecognizer.wordLabels();
+      console.log('Wake word labels:', labels);
       return true;
     } catch (e) {
-      console.warn('Porcupine wake word failed:', e);
+      console.warn('TF.js wake word failed:', e);
       hintText.textContent = 'Wake word desactivado: ' + e.message;
       return false;
     }
+  }
+
+  function startWakeWordListening(onlyWake = true) {
+    if (!wakeRecognizer || wakeListeningActive) return;
+    wakeListeningActive = true;
+    wakeWordActive = true;
+    try {
+      wakeRecognizer.listen(
+        (result) => {
+          if (state !== State.SLEEPING && !onlyWake) return;
+          const scores = result.scores;
+          const labels = wakeRecognizer.wordLabels();
+          const maxIdx = scores.indexOf(Math.max(...scores));
+          const word = labels[maxIdx] || '';
+          const confidence = scores[maxIdx] || 0;
+          if (word === 'yes' && confidence > 0.7) {
+            onWakeWord();
+          }
+        },
+        {
+          probabilityThreshold: 0.7,
+          invokeCallbackOnNoiseAndUnknown: true,
+          overlapFactor: 0.5,
+        }
+      );
+    } catch (e) {
+      console.warn('Wake word listen error:', e);
+      wakeListeningActive = false;
+    }
+  }
+
+  function stopWakeWordListening() {
+    if (!wakeRecognizer || !wakeListeningActive) return;
+    wakeListeningActive = false;
+    wakeWordActive = false;
+    try {
+      wakeRecognizer.stopListening();
+    } catch(e) {}
   }
 
   // ═══ Health check ════════════════════════════════════════════════════════
@@ -825,8 +842,8 @@
     source.connect(analyser);
     startWaveVisualization();
 
-    // Try wake word first (needs mic stream)
-    wakeWordEnabled = await initWakeWord(stream);
+    // Try wake word first (no necesita mic stream)
+    wakeWordReady = await initWakeWord();
 
     // Try Silero VAD with timeout
     try {
@@ -836,10 +853,11 @@
       );
       await Promise.race([vadPromise, timeoutPromise]);
 
-      if (wakeWordEnabled) {
-        connBadge.innerHTML = '✓ <span class="ok">Silero VAD + wake</span>';
+      if (wakeWordReady) {
+        connBadge.innerHTML = '✓ <span class="ok">Silero + wake</span>';
+        startWakeWordListening();
         setState(State.SLEEPING);
-        hintText.textContent = 'Di "Computer" para activarme';
+        hintText.textContent = 'Di "Yes" para activarme';
       } else {
         connBadge.innerHTML = '✓ <span class="ok">Silero VAD</span>';
         setState(State.LISTENING);
@@ -850,7 +868,8 @@
       console.warn('Silero VAD failed:', e);
       connBadge.innerHTML = '⚠ <span class="ok">VAD básico</span>';
       startBasicVAD();
-      if (wakeWordEnabled) {
+      if (wakeWordReady) {
+        startWakeWordListening();
         setState(State.SLEEPING);
       } else {
         setState(State.LISTENING);
@@ -865,7 +884,7 @@
         onWakeWord();
         break;
       case State.LISTENING:
-        if (wakeWordEnabled) goToSleep();
+        if (wakeWordReady) goToSleep();
         else startRecording();
         break;
       case State.SPEAKING:
@@ -978,7 +997,7 @@
     }
     if (e.key === 'Escape') {
       cancelCurrentResponse();
-      if (wakeWordEnabled && state !== State.SLEEPING) goToSleep();
+      if (wakeWordReady && state !== State.SLEEPING) goToSleep();
     }
   });
 
